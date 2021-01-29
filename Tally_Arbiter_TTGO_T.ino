@@ -73,8 +73,8 @@ const int tallyarbiter_port = 4455;
 /* END OF USER CONFIG */
 
 //ESP32 TTGO variables
-PinButton btn1(0); //bottom button, sleep button
-PinButton btnAction(35); //top button
+PinButton btn1(0); //bottom button, screen on/off
+PinButton btnAction(35); //top button, switch screen
 Preferences preferences;
 uint8_t wasPressed();
 bool backlight = true;
@@ -96,7 +96,7 @@ String LastMessage = "";
 
 //General Variables
 bool networkConnected = false;
-int currentScreen = 0; //0 = Tally Screen, 1 = Settings Screen
+int currentScreen = 0;        //0 = Tally Screen, 1 = Settings Screen
 
 void setup(void) {
   Serial.begin(115200);
@@ -173,7 +173,7 @@ void loop() {
     tft.setTextSize(1);
     logger("Disconnected from TallyArbiter", "info");
     digitalWrite(led_blue, HIGH);
-    delay(500);
+    delay(100);
   }
 }
 
@@ -260,7 +260,6 @@ void connectToServer() {
   socket.begin(tallyarbiter_host, tallyarbiter_port);
 }
 
- 
 void socket_Connected(const char * payload, size_t length) {
   logger("Connected to Tally Arbiter server.", "info");
   digitalWrite(led_blue, LOW);
@@ -270,8 +269,9 @@ void socket_Connected(const char * payload, size_t length) {
   strcpy(charDeviceObj, deviceObj.c_str());
   socket.emit("bus_options");
   socket.emit("device_listen_m5", charDeviceObj);
-  //socket.emit("device_listen", charDeviceObj);
+  socket.emit("devices");
 }
+
 void socket_BusOptions(const char * payload, size_t length) {
   BusOptions = JSON.parse(payload);
 }
@@ -292,6 +292,7 @@ void socket_DeviceStates(const char * payload, size_t length) {
   DeviceStates = JSON.parse(payload);
   processTallyData();
 }
+
 void socket_Flash(const char * payload, size_t length) {
   //flash the screen white 3 times
   tft.fillScreen(TFT_WHITE);
@@ -352,10 +353,13 @@ void socket_Messaging(const char * payload, size_t length) {
   String strPayload = String(payload);
   int typeQuoteIndex = strPayload.indexOf("\"");
   String messageType = strPayload.substring(0, typeQuoteIndex);
-  int messageQuoteIndex = strPayload.lastIndexOf("\"");
-  String message = strPayload.substring(messageQuoteIndex+1);
-  LastMessage = messageType + ": " + message;
-  evaluateMode();
+  //Only messages from producer and clients.
+  if (messageType != "server") {
+    int messageQuoteIndex = strPayload.lastIndexOf("\"");
+    String message = strPayload.substring(messageQuoteIndex+1);
+    LastMessage = messageType + ": " + message;
+    evaluateMode();
+  }
 }
 
 void processTallyData() {
@@ -402,7 +406,6 @@ void SetDeviceName() {
   preferences.begin("tally-arbiter", false);
   preferences.putString("devicename", DeviceName);
   preferences.end();
-
   evaluateMode();
 }
 
