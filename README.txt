@@ -7,3 +7,11 @@ When Voltage drops under 2.8V, it goes into sleep mode. Restart with top button.
 
 For the case I used the front panel of pjmi on Thingiverse: https://www.thingiverse.com/thing:4501444
 The back case is redesigned for holding a 10mm 3 color led, a battery and a camera shoe mount.
+
+I installed TallyArbiter on a pi. For the correct versions of node I used https://github.com/audstanley/NodeJs-Raspberry-Pi.
+For starting TallyArbiter at boot, I put these 4 lines in /etc/rc.local.
+(
+cd /home/pi/tallyarbiter
+node /home/pi/tallyarbiter/index.js &
+)
+pm2 didn't work for me.
