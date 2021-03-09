@@ -2,46 +2,18 @@
 #########################################################################################
 include libs:
 Websockets
-SocketIoClient
 Arduino_JSON
 TFT_eSPI
 MultiButton
 
-modify Arduino\libraries\SocketIoClient\SocketIoClient.cpp
-//hexdump(payload, length);       ## remove this line (41) with the //
-
-  and add boolean SocketIoConnected 2x:
-  
-  void SocketIoClient::webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-  String msg;
-  switch(type) {
-    case WStype_DISCONNECTED:
-      SOCKETIOCLIENT_DEBUG("[SIoC] Disconnected!\n");
-      SocketIoConnected = false;  ##add this line
-      break;
-    case WStype_CONNECTED:
-      SOCKETIOCLIENT_DEBUG("[SIoC] Connected to url: %s\n",  payload);
-      SocketIoConnected = true;   ##add this line
-      break;
-
-modify Arduino\libraries\SocketIoClient\SocketIoClient.h add boolean SocketIoConnected
-  public:
-    void beginSSL(const char* host, const int port = DEFAULT_PORT, const char* url = DEFAULT_URL, const char* fingerprint = DEFAULT_FINGERPRINT);
-    void begin(const char* host, const int port = DEFAULT_PORT, const char* url = DEFAULT_URL);
-    void loop();
-    void on(const char* event, std::function<void (const char * payload, size_t length)>);
-    void emit(const char* event, const char * payload = NULL);
-    void disconnect();
-    void setAuthorization(const char * user, const char * password);
-    bool SocketIoConnected;     ##add this line
- 
 Modify User_Setup_Select.h in libraryY TFT_eSPI
   //#include <User_Setup.h>
   #include <User_Setups/Setup25_TTGO_T_Display.h>
 #########################################################################################
 */
 #include <WiFi.h>
-#include <SocketIoClient.h>
+#include <WebSocketsClient.h>
+#include <SocketIOclient.h>
 #include <Arduino_JSON.h>
 #include <PinButton.h>
 #include <Preferences.h>
@@ -60,7 +32,6 @@ int vref = 1100;
 int batteryLevel = 100;
 int barLevel = 0;
 int LevelColor = TFT_WHITE;
-//uint8_t wasPressed();
 bool backlight = true;
 PinButton btntop(35); //top button, switch screen
 PinButton btnbottom(0); //bottom button, screen on/off
@@ -71,9 +42,13 @@ TFT_eSPI tft = TFT_eSPI();  // Invoke library, pins defined in User_Setup.h
 /* USER CONFIG VARIABLES
  *  Change the following variables before compiling and sending the code to your device.
  */
+
+bool CUT_BUS = false; // true = Programm + Preview = Red Tally; false = Programm + Preview = Yellow Tally screen
+bool LAST_MSG = true; // true = show messages on tally screen
+
 //Wifi SSID and password
-const char * networkSSID = "NetworkSSID";
-const char * networkPass = "NetworkPass";
+const char * networkSSID = "networkSSID";
+const char * networkPass = "networkPass";
 
 //For static IP Configuration, change USE_STATIC to true and define your IP address settings below
 bool USE_STATIC = false; // true = use static, false = use DHCP
@@ -82,13 +57,13 @@ IPAddress subnet(255, 255, 255, 0); // Subnet Mask
 IPAddress gateway(192, 168, 2, 1); // Gateway
 
 //Tally Arbiter Server
-const char * tallyarbiter_host = "192.168.0.3"; //IP address of the Tally Arbiter Server
+const char * tallyarbiter_host = "tallyarbiter"; //IP address or hostname of the Tally Arbiter Server
 const int tallyarbiter_port = 4455;
 
 /* END OF USER CONFIG */
 
 //Tally Arbiter variables
-SocketIoClient socket;
+SocketIOclient socket;
 JSONVar BusOptions;
 JSONVar Devices;
 JSONVar DeviceStates;
@@ -186,7 +161,11 @@ void showDeviceInfo() {
 void logger(String strLog, String strType) {
   if (strType == "info") {
     Serial.println(strLog);
-    tft.println(strLog);
+    int x = strLog.length();
+    for (int i=0; i < x; i=i+19) {
+      tft.println(strLog.substring(0,19));
+      strLog = strLog.substring(19);
+    }
   }
   else {
     Serial.println(strLog);
@@ -213,7 +192,11 @@ void WiFiEvent(WiFiEvent_t event) {
       networkConnected = true;
       break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
+      tft.setCursor(0, 0);
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextSize(2);
       logger("Network connection lost!", "info");
+      digitalWrite(led_blue, HIGH);
       networkConnected = false;
       delay(1000);
       connectToNetwork();
@@ -221,17 +204,77 @@ void WiFiEvent(WiFiEvent_t event) {
   }
 }
 
+void ws_emit(String event, const char *payload = NULL) {
+  if (payload) {
+    String msg = "[\"" + event + "\"," + payload + "]";
+    socket.sendEVENT(msg);
+  } else {
+    String msg = "[\"" + event + "\"]";
+    socket.sendEVENT(msg);
+  }
+}
+
 void connectToServer() {
   logger("Connecting to Tally Arbiter host: " + String(tallyarbiter_host), "info");
-  socket.on("connect", socket_Connected);
-  socket.on("bus_options", socket_BusOptions);
-  socket.on("deviceId", socket_DeviceId);
-  socket.on("devices", socket_Devices);
-  socket.on("device_states", socket_DeviceStates);
-  socket.on("flash", socket_Flash);
-  socket.on("reassign", socket_Reassign);
-  socket.on("messaging", socket_Messaging);
+  socket.onEvent(socket_event);
   socket.begin(tallyarbiter_host, tallyarbiter_port);
+}
+
+void socket_event(socketIOmessageType_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case sIOtype_DISCONNECT:
+      socket_Disconnected();
+      break;
+    case sIOtype_CONNECT:
+      socket_Connected((char*)payload, length);
+      break;
+    case sIOtype_ACK:
+    case sIOtype_ERROR:
+    case sIOtype_BINARY_EVENT:
+    case sIOtype_BINARY_ACK:
+      // Not handled
+      break;
+
+    case sIOtype_EVENT:
+      String msg = (char*)payload;
+      String type = msg.substring(2, msg.indexOf("\"",2));
+      String content = msg.substring(type.length() + 4);
+      content.remove(content.length() - 1);
+
+      logger("Got event '" + type + "', data: " + content, "info-quiet");
+
+      if (type == "bus_options") BusOptions = JSON.parse(content);
+      if (type == "reassign") socket_Reassign(content);
+      if (type == "flash") socket_Flash();
+      if (type == "messaging") socket_Messaging(content);
+
+      if (type == "deviceId") {
+        DeviceId = content.substring(1, content.length()-1);
+        SetDeviceName();
+        showDeviceInfo();
+        currentScreen = 0;
+      }
+
+      if (type == "devices") {
+        Devices = JSON.parse(content);
+        SetDeviceName();
+      }
+
+      if (type == "device_states") {
+        DeviceStates = JSON.parse(content);
+        processTallyData();
+      }
+
+      break;
+  }
+}
+
+void socket_Disconnected() {
+  digitalWrite(led_blue, HIGH);
+  tft.setCursor(0, 0);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  logger("Disconnected from   TallyArbiter!", "info");
 }
 
 void socket_Connected(const char * payload, size_t length) {
@@ -241,33 +284,12 @@ void socket_Connected(const char * payload, size_t length) {
   String deviceObj = "{\"deviceId\": \"" + DeviceId + "\", \"listenerType\": \"" + ListenerType + "\"}";
   char charDeviceObj[1024];
   strcpy(charDeviceObj, deviceObj.c_str());
-  socket.emit("bus_options");
-  socket.emit("device_listen_m5", charDeviceObj);
-  socket.emit("devices");
+  ws_emit("bus_options");
+  ws_emit("device_listen_m5", charDeviceObj);
+  ws_emit("devices");
 }
 
-void socket_BusOptions(const char * payload, size_t length) {
-  BusOptions = JSON.parse(payload);
-}
-
-void socket_Devices(const char * payload, size_t length) {
-  Devices = JSON.parse(payload);
-  SetDeviceName();
-}
-
-void socket_DeviceId(const char * payload, size_t length) {
-  DeviceId = String(payload);
-  SetDeviceName();
-  showDeviceInfo();
-  currentScreen = 0;
-}
-
-void socket_DeviceStates(const char * payload, size_t length) {
-  DeviceStates = JSON.parse(payload);
-  processTallyData();
-}
-
-void socket_Flash(const char * payload, size_t length) {
+void socket_Flash() {
   //flash the screen white 3 times
   tft.fillScreen(TFT_WHITE);
   digitalWrite(led_blue, HIGH);
@@ -298,13 +320,28 @@ void socket_Flash(const char * payload, size_t length) {
   }
 }
 
-void socket_Reassign(const char * payload, size_t length) {
-  String oldDeviceId = String(payload).substring(0,8);
-  String newDeviceId = String(payload).substring(11);
+String strip_quot(String str) {
+  if (str[0] == '"') {
+    str.remove(0, 1);
+  }
+  if (str.endsWith("\"")) {
+    str.remove(str.length()-1, 1);
+  }
+  return str;
+}
+
+void socket_Reassign(String payload) {
+  String oldDeviceId = payload.substring(0, payload.indexOf(','));
+  String newDeviceId = payload.substring(oldDeviceId.length()+1);
+  oldDeviceId = strip_quot(oldDeviceId);
+  newDeviceId = strip_quot(newDeviceId);
+  
   String reassignObj = "{\"oldDeviceId\": \"" + oldDeviceId + "\", \"newDeviceId\": \"" + newDeviceId + "\"}";
   char charReassignObj[1024];
   strcpy(charReassignObj, reassignObj.c_str());
-  socket.emit("listener_reassign_object", charReassignObj);
+  //socket.emit("listener_reassign_object", charReassignObj);
+  ws_emit("listener_reassign_object", charReassignObj);
+  ws_emit("devices");
   tft.fillScreen(TFT_WHITE);
   digitalWrite(led_blue, HIGH);
   delay(200);
@@ -323,14 +360,16 @@ void socket_Reassign(const char * payload, size_t length) {
   SetDeviceName();
 }
 
-void socket_Messaging(const char * payload, size_t length) {
+void socket_Messaging(String payload) {
   String strPayload = String(payload);
-  int typeQuoteIndex = strPayload.indexOf("\"");
+  int typeQuoteIndex = strPayload.indexOf(',');
   String messageType = strPayload.substring(0, typeQuoteIndex);
+  messageType.replace("\"", "");
   //Only messages from producer and clients.
   if (messageType != "server") {
-    int messageQuoteIndex = strPayload.lastIndexOf("\"");
-    String message = strPayload.substring(messageQuoteIndex+1);
+    int messageQuoteIndex = strPayload.lastIndexOf(',');
+    String message = strPayload.substring(messageQuoteIndex + 1);
+    message.replace("\"", "");
     LastMessage = messageType + ": " + message;
     evaluateMode();
   }
@@ -402,10 +441,15 @@ void evaluateMode() {
   }
   else if (mode_preview && mode_program) {
     logger("The device is in preview+program.", "info-quiet");
+    tft.setTextColor(TFT_BLACK);
+    if (CUT_BUS == true) {
+      tft.fillScreen(TFT_RED);
+    }
+    else {
+      tft.fillScreen(TFT_YELLOW);
+    }
     digitalWrite(led_program, HIGH);
     digitalWrite(led_preview, LOW);
-    tft.setTextColor(TFT_BLACK);
-    tft.fillScreen(TFT_YELLOW);
   }
   else {
     digitalWrite(led_program, LOW);
@@ -415,7 +459,10 @@ void evaluateMode() {
   }
   tft.println(DeviceName);
   tft.println("-------------------");
-  tft.println(LastMessage);
+  if (LAST_MSG == true) {
+    //tft.println(LastMessage);
+    logger(LastMessage, "info");
+  }
   tft.fillRect(232, 0, 8, 135, LevelColor);
   tft.fillRect(233, 1, 6, barLevel, TFT_BLACK);
 }
@@ -496,14 +543,5 @@ void loop() {
       digitalWrite(TFT_BL, HIGH);
       backlight = true;
     }
-  }
-  if (!socket.SocketIoConnected){
-    tft.setCursor(0, 0);
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_WHITE);
-    tft.setTextSize(1);
-    logger("Disconnected from TallyArbiter", "info");
-    digitalWrite(led_blue, HIGH);
-    delay(100);
   }
 }
