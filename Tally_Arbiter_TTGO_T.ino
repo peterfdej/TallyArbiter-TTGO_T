@@ -11,6 +11,7 @@ Modify User_Setup_Select.h in libraryY TFT_eSPI
   #include <User_Setups/Setup25_TTGO_T_Display.h>
 #########################################################################################
 */
+#include "SPIFFS.h"
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <SocketIOclient.h>
@@ -20,11 +21,30 @@ Modify User_Setup_Select.h in libraryY TFT_eSPI
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <Arduino.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 #include "esp_adc_cal.h"
 #include "TallyArbiter.h"
 
 #define ADC_EN  14  //ADC_EN is the ADC detection enable port
 #define ADC_PIN 34
+
+AsyncWebServer server(80);
+AsyncEventSource events("/events");
+
+const char* ssidPath = "/ssid.txt";
+const char* passPath = "/pass.txt";
+const char* ipPath = "/ip.txt";
+const char* portPath = "/port.txt";
+const char* SSID_INPUT = "ssid";
+const char* PASS_INPUT = "pass";
+const char* IP_INPUT = "ip";
+const char* PORT_INPUT = "port";
+String ssid;
+String pass;
+String ip;
+String port;
+String localip;
 
 float battery_voltage;
 String voltage;
@@ -33,34 +53,20 @@ int batteryLevel = 100;
 int barLevel = 0;
 int LevelColor = TFT_WHITE;
 bool backlight = true;
-PinButton btntop(35); //top button, switch screen
+PinButton btntop(35); //top button, switch screen. hold button while booting: setupmode
 PinButton btnbottom(0); //bottom button, screen on/off
 Preferences preferences;
 
 TFT_eSPI tft = TFT_eSPI();  // Invoke library, pins defined in User_Setup.h
 
-/* USER CONFIG VARIABLES
- *  Change the following variables before compiling and sending the code to your device.
- */
-
 bool CUT_BUS = false; // true = Programm + Preview = Red Tally; false = Programm + Preview = Yellow Tally screen
 bool LAST_MSG = true; // true = show messages on tally screen
-
-//Wifi SSID and password
-const char * networkSSID = "networkSSID";
-const char * networkPass = "networkPass";
 
 //For static IP Configuration, change USE_STATIC to true and define your IP address settings below
 bool USE_STATIC = false; // true = use static, false = use DHCP
 IPAddress clientIp(192, 168, 2, 5); // Static IP
 IPAddress subnet(255, 255, 255, 0); // Subnet Mask
 IPAddress gateway(192, 168, 2, 1); // Gateway
-
-//Tally Arbiter Server
-const char * tallyarbiter_host = "tallyarbiter"; //IP address or hostname of the Tally Arbiter Server
-const int tallyarbiter_port = 4455;
-
-/* END OF USER CONFIG */
 
 //Tally Arbiter variables
 SocketIOclient socket;
@@ -80,11 +86,55 @@ String LastMessage = "";
 //General Variables
 bool networkConnected = false;
 int currentScreen = 0;        //0 = Tally Screen, 1 = Settings Screen
+bool setupmode = false;
 
 void espDelay(int ms) {
   esp_sleep_enable_timer_wakeup(ms * 1000);
   esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
   esp_light_sleep_start();
+}
+
+// Initialize SPIFFS
+void initSPIFFS() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("An error has occurred while mounting SPIFFS");
+  }
+  else{
+    Serial.println("SPIFFS mounted successfully");
+  }
+}
+
+String readFile(fs::FS &fs, const char * path){
+  Serial.printf("Reading file: %s\r\n", path);
+
+  File file = fs.open(path);
+  if(!file || file.isDirectory()){
+    Serial.println("- failed to open file for reading");
+    return String();
+  }
+  
+  String fileContent;
+  while(file.available()){
+    fileContent = file.readStringUntil('\n');
+    break;     
+  }
+  Serial.println(fileContent);
+  return fileContent;
+}
+
+void writeFile(fs::FS &fs, const char * path, const char * message){
+  Serial.printf("Writing file: %s\r\n", path);
+
+  File file = fs.open(path, FILE_WRITE);
+  if(!file){
+    Serial.println("- failed to open file for writing");
+    return;
+  }
+  if(file.print(message)){
+    Serial.println("- file written");
+  } else {
+    Serial.println("- frite failed");
+  }
 }
 
 void showVoltage() {
@@ -134,11 +184,11 @@ void showSettings() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextSize(2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.println("SSID: " + String(networkSSID));
+  tft.println("SSID: " + String(ssid));
   tft.println(WiFi.localIP());
   tft.println();
-  tft.println("Tally Arbiter Server:");
-  tft.println(String(tallyarbiter_host) + ":" + String(tallyarbiter_port));
+  tft.println("TallyArbiter Server:");
+  tft.println(String(ip) + ":" + String(port));
   tft.println();
   Serial.println(voltage);
   if(battery_voltage >= 4.2){
@@ -150,7 +200,6 @@ void showSettings() {
   else {
     tft.println("Battery:" + String(batteryLevel) + "%");
      }
-
 }
 
 void showDeviceInfo() {
@@ -173,7 +222,7 @@ void logger(String strLog, String strType) {
 }
 
 void connectToNetwork() {
-  logger("Connecting to SSID: " + String(networkSSID), "info");
+  logger("Connecting to SSID: " + String(ssid), "info");
   WiFi.disconnect(true);
   WiFi.onEvent(WiFiEvent);
   WiFi.mode(WIFI_STA); //station
@@ -181,7 +230,8 @@ void connectToNetwork() {
   if(USE_STATIC == true) {
     WiFi.config(clientIp, gateway, subnet);
   }
-  WiFi.begin(networkSSID, networkPass);
+  //WiFi.begin(networkSSID, networkPass);
+  WiFi.begin(ssid.c_str(), pass.c_str());
 }
 
 void WiFiEvent(WiFiEvent_t event) {
@@ -215,9 +265,9 @@ void ws_emit(String event, const char *payload = NULL) {
 }
 
 void connectToServer() {
-  logger("Connecting to Tally Arbiter host: " + String(tallyarbiter_host), "info");
+  logger("Connecting to Tally Arbiter host: " + String(ip) + port, "info");
   socket.onEvent(socket_event);
-  socket.begin(tallyarbiter_host, tallyarbiter_port);
+  socket.begin(String(ip), port.toInt());
 }
 
 void socket_event(socketIOmessageType_t type, uint8_t * payload, size_t length) {
@@ -230,11 +280,12 @@ void socket_event(socketIOmessageType_t type, uint8_t * payload, size_t length) 
       break;
     case sIOtype_ACK:
     case sIOtype_ERROR:
+      socket_Disconnected();
+      break;
     case sIOtype_BINARY_EVENT:
     case sIOtype_BINARY_ACK:
       // Not handled
       break;
-
     case sIOtype_EVENT:
       String msg = (char*)payload;
       String type = msg.substring(2, msg.indexOf("\"",2));
@@ -247,24 +298,20 @@ void socket_event(socketIOmessageType_t type, uint8_t * payload, size_t length) 
       if (type == "reassign") socket_Reassign(content);
       if (type == "flash") socket_Flash();
       if (type == "messaging") socket_Messaging(content);
-
       if (type == "deviceId") {
         DeviceId = content.substring(1, content.length()-1);
         SetDeviceName();
         showDeviceInfo();
         currentScreen = 0;
       }
-
       if (type == "devices") {
         Devices = JSON.parse(content);
         SetDeviceName();
       }
-
       if (type == "device_states") {
         DeviceStates = JSON.parse(content);
         processTallyData();
       }
-
       break;
   }
 }
@@ -467,7 +514,6 @@ void evaluateMode() {
   tft.fillRect(233, 1, 6, barLevel, TFT_BLACK);
 }
 
-
 void setup(void) {
   Serial.begin(115200);
   while (!Serial);
@@ -491,13 +537,18 @@ void setup(void) {
   tft.setTextSize(1);
   tft.setSwapBytes(true);
   tft.pushImage(0, 0,  240, 135, TallyArbiter);
+  //check if top button is pressed at boot foor setup mode
+  if (digitalRead(35) == 0) {
+    setupmode = true;
+  }
   espDelay(5000);
   logger("Tally Arbiter TTGO Listener Client booting.", "info");
-  
-  connectToNetwork(); //starts Wifi connection
-  while (!networkConnected) {
-    delay(200);
-  }
+
+  initSPIFFS();
+  ssid = readFile(SPIFFS, ssidPath);
+  pass = readFile(SPIFFS, passPath);
+  ip = readFile(SPIFFS, ipPath);
+  port = readFile(SPIFFS, portPath);
 
   pinMode(led_program, OUTPUT);
   pinMode(led_preview, OUTPUT);
@@ -505,43 +556,106 @@ void setup(void) {
   digitalWrite(led_blue, HIGH);
   Serial.println("Blue LED ON.");
 
-  preferences.begin("tally-arbiter", false);
-  if(preferences.getString("deviceid").length() > 0){
-    DeviceId = preferences.getString("deviceid");
+  if(setupmode || ssid=="" || ip=="") {
+    Serial.println("Setting AP (Access Point)");
+    WiFi.softAP("TA-WIFI-MANAGER", NULL);
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("AP IP address: ");
+    Serial.println(IP);
+    localip = String() + WiFi.softAPIP()[0] + "." + WiFi.softAPIP()[1] + "." + WiFi.softAPIP()[2] + "." + WiFi.softAPIP()[3];
+    setupmode = true;
+
+    // Web Server Root URL For WiFi Manager Web Page
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(SPIFFS, "/index.html", "text/html");
+    });
+    server.serveStatic("/", SPIFFS, "/");
+    server.on("/", HTTP_POST, [](AsyncWebServerRequest *request) {
+      int params = request->params();
+      for(int i=0;i<params;i++){
+        AsyncWebParameter* p = request->getParam(i);
+        if(p->isPost()){
+          if (p->name() == SSID_INPUT) {
+            ssid = p->value().c_str();
+            writeFile(SPIFFS, ssidPath, ssid.c_str());
+          }
+          if (p->name() == PASS_INPUT) {
+            pass = p->value().c_str();
+            writeFile(SPIFFS, passPath, pass.c_str());
+          }
+          if (p->name() == IP_INPUT) {
+            ip = p->value().c_str();
+            writeFile(SPIFFS, ipPath, ip.c_str());
+          }
+          if (p->name() == PORT_INPUT) {
+            port = p->value().c_str();
+            writeFile(SPIFFS, portPath, port.c_str());
+          }
+        }
+      }
+      request->send(200, "text/plain", "Saved. Tally will restart.");
+      delay(3000);
+      ESP.restart();
+    });
+    server.begin();
   }
-  if(preferences.getString("devicename").length() > 0){
-    DeviceName = preferences.getString("devicename");
+  else {
+    connectToNetwork();
+    while (!networkConnected) {
+      delay(200);
+    }
+    Serial.println("connected");
+    Serial.println(WiFi.localIP());
+
+    preferences.begin("tally-arbiter", false);
+    if(preferences.getString("deviceid").length() > 0){
+      DeviceId = preferences.getString("deviceid");
+    }
+    if(preferences.getString("devicename").length() > 0){
+      DeviceName = preferences.getString("devicename");
+    }
+    preferences.end();
+    connectToServer();
   }
-  preferences.end();
-  
-  connectToServer();
 }
 
 void loop() {
-  socket.loop();
-  btntop.update();
-  btnbottom.update();
-  showVoltage();
 
-  if (btntop.isClick()) {
-    switch (currentScreen) {
-      case 0:
-        showSettings();
-        currentScreen = 1;
-        break;
-      case 1:
-        showDeviceInfo();
-        currentScreen = 0;
-        break;
+  if (setupmode) {
+    digitalWrite(led_blue, HIGH);
+      tft.setCursor(0, 0);
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextSize(2);
+      logger("Setup mode", "info");
+      logger("Connect to:", "info");
+      logger("TA-WIFI-MANAGER", "info");
+      logger("http://" + localip, "info");
+      delay(2000);
+  } else {
+    socket.loop();
+    btntop.update();
+    btnbottom.update();
+    showVoltage();
+    if (btntop.isClick()) {
+      switch (currentScreen) {
+        case 0:
+          showSettings();
+          currentScreen = 1;
+          break;
+        case 1:
+          showDeviceInfo();
+          currentScreen = 0;
+          break;
+      }
     }
-  }
-  if (btnbottom.isClick()) {
-    if (backlight == true) {
-      digitalWrite(TFT_BL, LOW);
-      backlight = false;
-    } else {
-      digitalWrite(TFT_BL, HIGH);
-      backlight = true;
+    if (btnbottom.isClick()) {
+      if (backlight == true) {
+        digitalWrite(TFT_BL, LOW);
+        backlight = false;
+      } else {
+        digitalWrite(TFT_BL, HIGH);
+        backlight = true;
+      }
     }
   }
 }
